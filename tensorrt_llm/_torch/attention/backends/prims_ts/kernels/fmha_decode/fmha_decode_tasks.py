@@ -717,6 +717,7 @@ class DecodeGenTask(Task):
     def _run_packed_skip_iteration(
         self,
         work_tile: Any,
+        context: ResourceContext | None = None,
     ) -> None:
         """Advance one inactive tile through WorkQueue bookkeeping only."""
         # Packed schedules place every data-path entry inside ``skippable()``;
@@ -731,6 +732,7 @@ class DecodeGenTask(Task):
                     head_entries,
                     work_tile,
                     bookkeeping_domain,
+                    context,
                 )
         for is_skippable_tail, tail_entries in self._tail_exec_groups:
             if cutlass.const_expr(not is_skippable_tail):
@@ -738,6 +740,7 @@ class DecodeGenTask(Task):
                     tail_entries,
                     work_tile,
                     bookkeeping_domain,
+                    context,
                 )
 
     @cute.jit
@@ -745,12 +748,14 @@ class DecodeGenTask(Task):
         self,
         work_tile: cute.Coord,
         skip_work_tile: Any = None,
+        context: ResourceContext | None = None,
     ) -> None:
         """Run one ordinary task tile and synchronize attention-sink tails."""
         Task._run_task_body_impl(
             self,
             work_tile,
             skip_work_tile,
+            context=context,
         )
         if cutlass.const_expr(
             self.cfg is not None
@@ -778,7 +783,10 @@ class DecodeGenTask(Task):
                 prims.barrier_cta_sync(12, thread_count=16 * 32)
 
     @cute.jit
-    def _run_task_body_persistent(self) -> None:
+    def _run_task_body_persistent(
+        self,
+        context: ResourceContext | None = None,
+    ) -> None:
         """Drain inactive packed tiles before each unconditional active body."""
         use_packed_early_stop = (
             self.cfg is not None
@@ -787,14 +795,14 @@ class DecodeGenTask(Task):
             and self._has_skip_if
         )
         if cutlass.const_expr(not use_packed_early_stop):
-            Task._run_task_body_persistent(self)
+            Task._run_task_body_persistent(self, context)
             return
 
         assert self.work_queue is not None
         work_tile = self.work_queue.initial_work_tile_info()
         self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
 
-        self._run_pre_work_loop_entries(work_tile)
+        self._run_pre_work_loop_entries(work_tile, context)
         work_tile = self.work_queue._get_consumer_var_from_ts("work_tile")
         for resource in self.dst_resources:
             if cutlass.const_expr(
@@ -808,7 +816,7 @@ class DecodeGenTask(Task):
         # inner loop executes only the non-skippable WorkQueue tail, so no TMA,
         # descriptor, pipeline, task data, or sink barrier is issued.
         while work_tile.is_valid_tile and self._should_skip_work_tile(work_tile):
-            self._run_packed_skip_iteration(work_tile)
+            self._run_packed_skip_iteration(work_tile, context)
             work_tile = self.work_queue._get_consumer_var_from_ts("work_tile")
             self.dummy = cutlass.Boolean(True)
 
@@ -817,18 +825,18 @@ class DecodeGenTask(Task):
             # The tile is known active here. Running the complete schedule
             # without a dynamic skip guard keeps HEAD-produced pipeline state
             # in scope for LOOP and TAIL.
-            Task._run_task_body_impl(self, work_tile, None)
+            Task._run_task_body_impl(self, work_tile, None, context=context)
             if cutlass.const_expr(self.cfg.use_attention_sinks):
                 prims.barrier_cta_sync(12, thread_count=16 * 32)
             work_tile = self.work_queue._get_consumer_var_from_ts("work_tile")
             self.dummy = cutlass.Boolean(True)
 
             while work_tile.is_valid_tile and self._should_skip_work_tile(work_tile):
-                self._run_packed_skip_iteration(work_tile)
+                self._run_packed_skip_iteration(work_tile, context)
                 work_tile = self.work_queue._get_consumer_var_from_ts("work_tile")
                 self.dummy = cutlass.Boolean(True)
 
-        self._run_post_work_loop_entries(work_tile)
+        self._run_post_work_loop_entries(work_tile, context)
         for resource in self.dst_resources:
             if cutlass.const_expr(
                 resource.pipeline_config is not None
@@ -1608,8 +1616,8 @@ def create_load_task_split_kv(
                 "load_v0",
             ),
             (
-                smem_k1,
-                smem_v1,
+                smem_k0 if smem_k1 is None and not cfg.use_block_sparse else smem_k1,
+                smem_v0 if smem_v1 is None and not cfg.use_block_sparse else smem_v1,
                 sparse_kv_metadata1,
                 sparse_softmax_metadata1,
                 "load_k1",
@@ -1618,12 +1626,9 @@ def create_load_task_split_kv(
         )
         # Preserve the original full-resource lowering order while allowing a
         # per-instance task to omit the other stream's resources.
-        for smem_k, _, _, _, _, _ in active_instances:
-            if smem_k is not None:
-                smem_k.init_load_state()
-        for _, smem_v, _, _, _, _ in active_instances:
-            if smem_v is not None:
-                smem_v.init_load_state()
+        for resource in (smem_k0, smem_k1, smem_v0, smem_v1):
+            if resource is not None:
+                resource.init_load_state()
         for _, _, sparse_kv_metadata, _, _, _ in active_instances:
             if sparse_kv_metadata is not None:
                 sparse_kv_metadata.init_load_state()
@@ -2187,10 +2192,9 @@ def create_mma_task_split_kv(
     ) -> None:
         """Initialize invariant split-resource descriptor slots."""
         smem_q.init_descriptor_state()
-        smem_k0.init_descriptor_state()
-        smem_k1.init_descriptor_state()
-        smem_v0.init_descriptor_state()
-        smem_v1.init_descriptor_state()
+        for resource in (smem_k0, smem_k1, smem_v0, smem_v1):
+            if resource is not None:
+                resource.init_descriptor_state()
         smem_p0.init_descriptor_state()
         smem_p1.init_descriptor_state()
 
@@ -2304,9 +2308,9 @@ def create_mma_task_split_kv(
             mma_schedule(
                 smem_q,
                 smem_k0,
-                smem_k1,
+                smem_k0 if smem_k1 is None else smem_k1,
                 smem_v0,
-                smem_v1,
+                smem_v0 if smem_v1 is None else smem_v1,
                 tmem_s0,
                 tmem_s1,
                 smem_p0,
@@ -2317,9 +2321,9 @@ def create_mma_task_split_kv(
             else mma_schedule(
                 smem_q,
                 smem_k0,
-                smem_k1,
+                smem_k0 if smem_k1 is None else smem_k1,
                 smem_v0,
-                smem_v1,
+                smem_v0 if smem_v1 is None else smem_v1,
                 tmem_s0,
                 tmem_s1,
                 smem_p0,
@@ -2334,9 +2338,9 @@ def create_mma_task_split_kv(
             mma_keeps_schedule(
                 smem_q,
                 smem_k0,
-                smem_k1,
+                smem_k0 if smem_k1 is None else smem_k1,
                 smem_v0,
-                smem_v1,
+                smem_v0 if smem_v1 is None else smem_v1,
                 tmem_s0,
                 tmem_s1,
                 smem_p0,
@@ -2349,9 +2353,9 @@ def create_mma_task_split_kv(
             else mma_keeps_schedule(
                 smem_q,
                 smem_k0,
-                smem_k1,
+                smem_k0 if smem_k1 is None else smem_k1,
                 smem_v0,
-                smem_v1,
+                smem_v0 if smem_v1 is None else smem_v1,
                 tmem_s0,
                 tmem_s1,
                 smem_p0,
@@ -2369,7 +2373,11 @@ def create_mma_task_split_kv(
             tmem_stats_done0,
             tmem_stats_done1,
         ]
-    src = [smem_q, smem_k0, smem_k1, smem_v0, smem_v1, smem_p0, smem_p1]
+    src = [
+        resource
+        for resource in (smem_q, smem_k0, smem_k1, smem_v0, smem_v1, smem_p0, smem_p1)
+        if resource is not None
+    ]
     if work_queue is not None:
         src.append(work_queue)
     return task_class(
