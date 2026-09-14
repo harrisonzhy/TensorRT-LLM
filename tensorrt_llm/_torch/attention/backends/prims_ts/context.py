@@ -31,8 +31,7 @@ position is ``q + (S_kv - S_q)`` and ``window_left`` is measured from that
 position.
 
 PrimTS context entry points are intentionally excluded from ``fi_trace`` for
-now; unlike the decode APIs, their ``@flashinfer_api`` decorators do not
-register trace templates.
+now; their ``@flashinfer_api`` decorators do not register trace templates.
 """
 
 from dataclasses import dataclass
@@ -479,7 +478,7 @@ def _validate_device(device: torch.device) -> int:
     # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
     # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
     if capability == (10, 7):
-        from ...cute_dsl.utils import require_cute_dsl_arch
+        from flashinfer.cute_dsl.utils import require_cute_dsl_arch
 
         require_cute_dsl_arch(device_index)
     return device_index
