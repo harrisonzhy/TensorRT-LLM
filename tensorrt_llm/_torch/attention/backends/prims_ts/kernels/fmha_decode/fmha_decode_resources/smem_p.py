@@ -535,7 +535,6 @@ class SmemPResource(DecodeGenResourceBase):
         total_pair = cute.arch.add_packed_f32x2(sum01, sum23)
         return Float32(total_pair[0] + total_pair[1])
 
-    @producer_work
     @cute.jit
     def _proxy_fragment_sum(
         self,

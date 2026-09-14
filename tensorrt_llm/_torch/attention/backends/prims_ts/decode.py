@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,11 +26,6 @@ from typing import TYPE_CHECKING, Literal, Optional, Union
 import torch
 
 from flashinfer.api_logging import flashinfer_api
-from flashinfer.trace.templates.attention import (
-    attention_ts_decode_trace_dispatch,
-    prims_ts_decode_trace_dispatch,
-    prims_ts_decode_wrapper_trace_dispatch,
-)
 
 from ._tensor_aliasing import (
     _validate_out_does_not_overlap_inputs,
@@ -668,6 +664,19 @@ def _validate_dtype_pair(
     _dtype_key(k_dtype)
     _dtype_key(v_dtype)
     _dtype_key(output_dtype)
+    if k_dtype != q_dtype:
+        raise NotImplementedError(
+            "attention-ts decode requires Q and K to use the same dtype; "
+            f"got Q {q_dtype} and K {k_dtype}"
+        )
+    # V may keep its own dtype only for the supported QK-BF16/PV-FP8 path.
+    if v_dtype != q_dtype and not (
+        q_dtype == torch.bfloat16 and v_dtype == torch.float8_e4m3fn
+    ):
+        raise NotImplementedError(
+            "attention-ts decode requires Q, K, and V to use the same dtype "
+            f"except for QK-BF16/PV-FP8; got Q {q_dtype} and V {v_dtype}"
+        )
     supported = (
         (q_dtype == torch.float16 and output_dtype == torch.float16)
         or (q_dtype == torch.bfloat16 and output_dtype == torch.bfloat16)
@@ -705,7 +714,7 @@ def _validate_runtime_device(device: torch.device) -> int:
     # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
     # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
     if capability == (10, 7):
-        from ...cute_dsl.utils import require_cute_dsl_arch
+        from flashinfer.cute_dsl.utils import require_cute_dsl_arch
 
         require_cute_dsl_arch(device_index)
     return device_index
@@ -2163,7 +2172,7 @@ def _validate_decode_run_metadata_values(
                 )
 
 
-@flashinfer_api(trace=prims_ts_decode_trace_dispatch)
+@flashinfer_api
 def prims_ts_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: PagedKVCache,
@@ -2726,7 +2735,7 @@ class BatchDecodePagedTSWrapper:
         # previous complete plan revision usable.
         self._plan_state = candidate
 
-    @flashinfer_api(trace=prims_ts_decode_wrapper_trace_dispatch)
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
@@ -2912,7 +2921,7 @@ class BatchDecodePagedTSWrapper:
         )
 
 
-@flashinfer_api(trace=attention_ts_decode_trace_dispatch)
+@flashinfer_api
 def batch_decode_with_paged_kv_cache(
     q: torch.Tensor,
     paged_kv_cache: PagedKVCache,
