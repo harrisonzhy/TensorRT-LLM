@@ -43,7 +43,10 @@ from .phased import FmhaParams, PhasedFmha
 from .utils import get_kv_page_offset, get_multi_processor_count_for_device
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillPagedTSWrapper
+    from tensorrt_llm._torch.attention.backends.prims_ts.context import (
+        BatchPrefillPagedTSWrapper,
+        BatchPrefillTSWrapper,
+    )
     from tensorrt_llm._torch.attention.backends.prims_ts.decode import BatchDecodePagedTSWrapper
     from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
         BatchMLADecodePagedTSWrapper,
@@ -57,6 +60,8 @@ if TYPE_CHECKING:
 _MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
 _MIN_CUTLASS_COMPILER_VERSION = "13.3"
 _WORKSPACE_ALIGNMENT = 32
+# (q dtype, v dtype, batch, seq_len) combinations already announced in the log.
+_LOGGED_NO_KV_CACHE_PATHS: set[tuple[Any, ...]] = set()
 
 
 def get_paged_kv_storage_unsupported_reason(
@@ -167,6 +172,8 @@ class PrimsTSFmha(PhasedFmha):
         # Every other plan attribute is fixed by this layer/model instance.
         # Batch size is the only execution profile that needs its own wrapper.
         self._context_wrappers: dict[int, "BatchPrefillPagedTSWrapper"] = {}
+        # Cache-free (no KV-cache manager) context plans, e.g. VisualGen diffusion.
+        self._contiguous_context_wrappers: dict[tuple[Any, ...], "BatchPrefillTSWrapper"] = {}
         self._decode_wrappers: dict[int, "BatchDecodePagedTSWrapper"] = {}
         self._mla_decode_wrappers: dict[int, "BatchMLADecodePagedTSWrapper"] = {}
         # Decode plans retain views into the shared workspace and are invalidated
@@ -285,9 +292,13 @@ class PrimsTSFmha(PhasedFmha):
             return False, "only fused QKV input is supported."
         if meta.is_cross:
             return False, "cross attention is not supported."
-        storage_reason = get_paged_kv_storage_unsupported_reason(attn, meta)
-        if storage_reason is not None:
-            return False, storage_reason
+        # Cache-free requests (e.g. VisualGen diffusion) skip the paged-KV
+        # storage contract and are validated separately below.
+        no_kv_cache = meta.kv_cache_manager is None
+        if not no_kv_cache:
+            storage_reason = get_paged_kv_storage_unsupported_reason(attn, meta)
+            if storage_reason is not None:
+                return False, storage_reason
 
         output = fwd.output
         if output is None:
@@ -309,6 +320,8 @@ class PrimsTSFmha(PhasedFmha):
         feature_reason = get_attention_feature_unsupported_reason(meta, fwd)
         if feature_reason is not None:
             return False, feature_reason
+        if no_kv_cache:
+            return self._is_supported_no_kv_cache_reason(q, attn, meta, fwd)
 
         try:
             mask_type = AttentionMaskType(fwd.mask_type)
@@ -333,6 +346,11 @@ class PrimsTSFmha(PhasedFmha):
         has_generation = num_generations > 0 and input_type != AttentionInputType.context_only
         if not has_context and not has_generation:
             return False, "the request contains no active attention phase."
+        if fwd.primsts_pv_fp8:
+            if q.dtype != torch.bfloat16:
+                return False, "PV-FP8 requires BF16 query and key inputs."
+            if has_generation:
+                return False, "PV-FP8 is wired for the context phase only."
         if has_context and (attn.attention_chunk_size or 0) != 0:
             return False, "chunked context attention is not supported."
 
@@ -658,6 +676,187 @@ class PrimsTSFmha(PhasedFmha):
         self._mla_decode_wrappers[batch_size] = wrapper
         return wrapper
 
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+    ) -> None:
+        if metadata.kv_cache_manager is None:
+            self._forward_no_kv_cache(q, metadata, forward_args)
+            return
+        super().forward(q, k, v, metadata, forward_args)
+
+    def _is_supported_no_kv_cache_reason(
+        self,
+        q: torch.Tensor,
+        attn: "TrtllmAttention",
+        meta: "TrtllmAttentionMetadata",
+        fwd: AttentionForwardArgs,
+    ) -> tuple[bool, str]:
+        """Support decision for cache-free fused-QKV context attention (e.g. VisualGen)."""
+        if attn.is_mla_enable:
+            return False, "cache-free attention does not support MLA."
+        if (
+            fwd.attention_input_type == AttentionInputType.generation_only
+            or int(meta.num_generations) > 0
+        ):
+            return False, "cache-free attention supports the context phase only."
+        num_contexts = int(meta.num_contexts)
+        if num_contexts <= 0:
+            return False, "the request contains no active context requests."
+        if (attn.attention_chunk_size or 0) != 0:
+            return False, "chunked context attention is not supported."
+        try:
+            mask_type = AttentionMaskType(fwd.mask_type)
+        except (AttributeError, TypeError, ValueError):
+            return False, "the attention mask is not causal or dense."
+        if mask_type not in (AttentionMaskType.causal, AttentionMaskType.padding):
+            return False, f"attention mask type {mask_type} is not supported."
+        if (
+            attn.num_heads <= 0
+            or attn.num_kv_heads <= 0
+            or attn.num_heads % attn.num_kv_heads != 0
+        ):
+            return False, "the query head count must be a positive multiple of the KV head count."
+        if attn.head_dim not in self.SUPPORTED_CONTEXT_HEAD_DIMS:
+            return False, f"context head dimension {attn.head_dim} is unsupported."
+        if q.dtype not in self.SUPPORTED_DTYPES:
+            return False, f"query dtype {q.dtype} is unsupported."
+        output = fwd.output
+        if output.dtype != q.dtype:
+            return False, f"output dtype must match query dtype, got {output.dtype} and {q.dtype}."
+        if fwd.primsts_pv_fp8 and q.dtype != torch.bfloat16:
+            return False, "PV-FP8 requires BF16 query and key inputs."
+        if q.ndim != 2:
+            return False, f"fused attention input must be rank 2, got rank {q.ndim}."
+        expected_width = (attn.num_heads + 2 * attn.num_kv_heads) * attn.head_dim
+        if q.shape[1] != expected_width:
+            return False, f"fused QKV width must be {expected_width}, got {q.shape[1]}."
+        if output.numel() != q.shape[0] * attn.num_heads * attn.head_dim:
+            return False, "attention output has an incompatible extent."
+        seq_len = int(meta.max_seq_len)
+        host_lens = meta.prompt_lens_cpu_runtime
+        if host_lens is None or host_lens.numel() < num_contexts:
+            return False, "host context lengths are required."
+        active_lens = host_lens[:num_contexts]
+        if (
+            seq_len <= 0
+            or q.shape[0] != num_contexts * seq_len
+            or int(active_lens.min()) != seq_len
+            or int(active_lens.max()) != seq_len
+        ):
+            return False, "cache-free attention requires uniform sequence lengths."
+        window = fwd.attention_window_size
+        if isinstance(window, int) and 0 < window < seq_len:
+            return False, "sliding-window attention is not supported."
+        return True, ""
+
+    def _get_or_plan_contiguous_context_wrapper(
+        self,
+        q: torch.Tensor,
+        v_dtype: torch.dtype,
+        *,
+        batch_size: int,
+        seq_len: int,
+        mask_type: str,
+        sm_scale: float,
+        output_dtype: torch.dtype,
+    ) -> "BatchPrefillTSWrapper":
+        key = (batch_size, seq_len, q.dtype, v_dtype, output_dtype, mask_type)
+        wrapper = self._contiguous_context_wrappers.get(key)
+        if wrapper is not None:
+            return wrapper
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("PrimTS context must be planned before CUDA graph capture.")
+        from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillTSWrapper
+
+        attn = self.attn
+        wrapper = BatchPrefillTSWrapper()
+        wrapper.plan(
+            device=q.device,
+            batch_size=batch_size,
+            max_seq_len_q=seq_len,
+            max_kv_len=seq_len,
+            num_qo_heads=attn.num_heads,
+            num_kv_heads=attn.num_kv_heads,
+            head_dim=attn.head_dim,
+            q_dtype=q.dtype,
+            k_dtype=q.dtype,
+            v_dtype=v_dtype,
+            out_dtype=output_dtype,
+            packed=False,
+            mask_type=mask_type,
+            window_left=-1,
+            sm_scale=sm_scale,
+            output_scale=1.0,
+        )
+        self._contiguous_context_wrappers[key] = wrapper
+        return wrapper
+
+    def _forward_no_kv_cache(
+        self,
+        q: torch.Tensor,
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+    ) -> None:
+        """Cache-free fused-QKV context attention on the contiguous PrimTS kernel."""
+        attn = self.attn
+        output = forward_args.output
+        if output is None:
+            raise RuntimeError("PrimTS context requires an output buffer.")
+        batch_size = int(metadata.num_contexts)
+        seq_len = int(metadata.max_seq_len)
+        num_heads, num_kv_heads, head_dim = attn.num_heads, attn.num_kv_heads, attn.head_dim
+        q_width = num_heads * head_dim
+        kv_width = num_kv_heads * head_dim
+        qkv = q.view(batch_size, seq_len, q_width + 2 * kv_width)
+        # Column slices of the row-major fused QKV are not compact; the fixed
+        # contiguous plan requires compact [B, S, H, D] operands, so each slice
+        # is materialized once per call.
+        q_bshd = qkv[..., :q_width].reshape(batch_size, seq_len, num_heads, head_dim).contiguous()
+        k_bshd = (
+            qkv[..., q_width : q_width + kv_width]
+            .reshape(batch_size, seq_len, num_kv_heads, head_dim)
+            .contiguous()
+        )
+        v_bshd = (
+            qkv[..., q_width + kv_width :]
+            .reshape(batch_size, seq_len, num_kv_heads, head_dim)
+            .contiguous()
+        )
+        output_scale = None
+        if forward_args.primsts_pv_fp8:
+            v_bshd, v_dequant_scale = torch.ops.trtllm.quantize_e4m3_per_tensor(v_bshd)
+            output_scale = v_dequant_scale.float().reshape(1)
+        path_key = (q_bshd.dtype, v_bshd.dtype, batch_size, seq_len)
+        if path_key not in _LOGGED_NO_KV_CACHE_PATHS:
+            _LOGGED_NO_KV_CACHE_PATHS.add(path_key)
+            logger.info(
+                "PrimTS cache-free context: q/k_dtype=%s v_dtype=%s batch=%d seq_len=%d heads=%d/%d head_dim=%d"
+                % (q_bshd.dtype, v_bshd.dtype, batch_size, seq_len, num_heads, num_kv_heads, head_dim)
+            )
+        out = output.view(batch_size, seq_len, num_heads, head_dim)
+        wrapper = self._get_or_plan_contiguous_context_wrapper(
+            q_bshd,
+            v_bshd.dtype,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            mask_type=self._get_prims_mask_type(forward_args),
+            sm_scale=self._get_bmm1_scale(attn),
+            output_dtype=out.dtype,
+        )
+        wrapper.run(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            out=out,
+            output_scale=output_scale,
+            validate=False,
+        )
+
     def prepare_workspace(
         self,
         q: torch.Tensor,
@@ -926,6 +1125,15 @@ class PrimsTSFmha(PhasedFmha):
         if kv_page_offset is None:
             raise RuntimeError("PrimTS could not resolve the K-to-V page displacement.")
         k_cache, v_cache = self._standard_kv_views(kv_pool, kv_page_offset)
+        output_scale = None
+        if fwd.primsts_pv_fp8:
+            # Per-tensor FP8 V for the QK-BF16/PV-FP8 kernel path. The paged pool
+            # stays BF16; only this call's V operand is quantized, and the dequant
+            # scale is folded into the kernel's per-run output scale.
+            v_cache, v_dequant_scale = torch.ops.trtllm.quantize_e4m3_per_tensor(
+                v_cache.contiguous()
+            )
+            output_scale = v_dequant_scale.float().reshape(1)
         max_seq_len_q = int(meta.max_context_length)
         max_kv_len = int(meta.max_seq_len)
         fixed_block_tables = self._get_fixed_block_tables(block_tables, params.batch_size)
@@ -955,6 +1163,7 @@ class PrimsTSFmha(PhasedFmha):
             block_tables=fixed_block_tables,
             seq_lens_kv=seq_lens_kv,
             out=params.context_buf,
+            output_scale=output_scale,
             validate=False,
         )
 

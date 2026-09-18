@@ -284,11 +284,12 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
         timestep = kwargs.pop("timestep", None)
 
-        if self.quant_attention_config is not None:
+        quant_cfg = self.quant_attention_config
+        use_primsts_pv_fp8 = quant_cfg is not None and quant_cfg.is_primsts_pv_fp8()
+        if quant_cfg is not None and not use_primsts_pv_fp8:
             assert k is not None and v is not None, (
                 "SageAttention requires separate Q, K, V tensors"
             )
-            quant_cfg = self.quant_attention_config
             q = q.reshape(batch_size * seq_len, -1).contiguous()
             k = k.reshape(batch_size * kv_seq_len, -1).contiguous()
             v = v.reshape(batch_size * kv_seq_len, -1).contiguous()
@@ -316,6 +317,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 metadata=prepared_metadata,
                 attention_mask=attention_mask,
                 timestep=timestep,
+                primsts_pv_fp8=use_primsts_pv_fp8,
             )
         output = output.view(batch_size, seq_len, -1)
         return output
@@ -326,5 +328,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         return self._preferred_layout
 
     def support_fused_qkv(self) -> bool:
-        """Standard path fuses QKV; SageAttention path does not."""
-        return self.quant_attention_config is None
+        """Standard and PrimTS PV-FP8 paths fuse QKV; SageAttention path does not."""
+        quant_cfg = self.quant_attention_config
+        return quant_cfg is None or quant_cfg.is_primsts_pv_fp8()

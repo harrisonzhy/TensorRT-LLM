@@ -92,6 +92,14 @@ class QuantAttentionConfig(StrictBaseModel):
         ),
     )
 
+    def is_primsts_pv_fp8(self) -> bool:
+        """PrimTS recipe: BF16 Q/K, per-tensor FP8 V, no SAGE blocks (TRTLLM backend)."""
+        return (
+            self.qk_dtype == "bf16"
+            and self.v_dtype == "fp8"
+            and (self.q_block_size, self.k_block_size, self.v_block_size) == (0, 0, 0)
+        )
+
 
 # Discriminated union of sparse attention configs.
 SparseAttentionConfig = Annotated[
@@ -171,12 +179,16 @@ class AttentionConfig(StrictBaseModel):
                         f"int8 Q/K SAGE quantized attention (backend='TRTLLM', "
                         f"qk_dtype='int8', v_dtype='{q_config.v_dtype}') only supports sm_100."
                     )
+            elif q_config.is_primsts_pv_fp8():
+                # PrimTS QK-BF16/PV-FP8. Served by the prims_ts FMHA library, which is
+                # opt-in via TLLM_FMHA_LIBS; other TRTLLM FMHA libraries ignore it.
+                pass
             else:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='TRTLLM'. Supported SAGE recipes "
-                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
-                    f"{sorted(SAGE_RECIPES)}."
+                    f"for backend='TRTLLM'. Supported recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): SAGE "
+                    f"{sorted(SAGE_RECIPES)} or PrimTS ('bf16', 'fp8', (0, 0, 0))."
                 )
         elif self.backend == "CUTEDSL":
             if recipe not in CUTEDSL_RECIPES:

@@ -958,6 +958,8 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
+    # PrimTS QK-BF16/PV-FP8: quantize V to FP8 (per-tensor) inside the FMHA adapter.
+    primsts_pv_fp8: bool = False
 
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
