@@ -380,7 +380,8 @@ def test_trtllm_skip_softmax_cutoff_is_capturable_with_a_device_timestep() -> No
 
 def test_vc_attention_eager_runs_keep_only_the_current_shape(monkeypatch) -> None:
     """Without the CUDA graph runner the layer drops the value grouping of a previous
-    K/V shape; under the runner every captured shape keeps its grouping."""
+    K/V shape; under the runner every captured shape keeps its grouping. The grouped
+    token range of a call reaches the preprocessor."""
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
     monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
@@ -408,3 +409,20 @@ def test_vc_attention_eager_runs_keep_only_the_current_shape(monkeypatch) -> Non
         operands(512)
         operands(256)
     assert attention._vc_preprocessor is second
+    # The grouped token range of a call reaches the preprocessor; a call without
+    # one groups the whole sequence.
+    from tensorrt_llm._torch.attention.backends.prims_ts.vc_attention.quantization import (
+        VCAttentionPreprocessor,
+    )
+
+    seen = []
+
+    def prepare(self, k, v, *, q=None, denoise_step=None, grouped_tokens=None):
+        seen.append(grouped_tokens)
+        return Mock()
+
+    monkeypatch.setattr(VCAttentionPreprocessor, "prepare", prepare)
+    x = torch.randn(256, 2 * 128, device="cuda", dtype=torch.bfloat16)
+    attention._vc_operands(x, x, x, 1, 256, 256, None)
+    attention._vc_operands(x, x, x, 1, 256, 256, None, (0, 128))
+    assert seen == [None, (0, 128)]

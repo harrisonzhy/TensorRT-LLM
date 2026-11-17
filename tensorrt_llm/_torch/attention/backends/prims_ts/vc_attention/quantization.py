@@ -66,6 +66,8 @@ VC_SMOOTH_STEP_FRACTION = 0.25
 VC_PERM_REFRESH_EVERY = 4
 VC_KMEANS_CLUSTERS = 64
 VC_KMEANS_ITERS = 3
+# Seed of the preprocessor's own k-means generator at every cold start.
+VC_KMEANS_SEED = 0
 
 
 @dataclass(frozen=True)
@@ -136,6 +138,7 @@ def vc_token_permutation(
     iters: int = VC_KMEANS_ITERS,
     generator: torch.Generator | None = None,
     init_centroids: torch.Tensor | None = None,
+    grouped_tokens: tuple[int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Group similar value rows by k-means per batch and head, then argsort the labels.
 
@@ -144,8 +147,38 @@ def vc_token_permutation(
     tiles hold similar values and their tile means remove most of the value
     energy. ``init_centroids`` from a previous call warm-starts the clustering,
     as the paper does when the grouping is refreshed a few denoising steps later.
+    A cold start seeds every batch element and head with the same draw of
+    ``generator`` (the global one when ``None``), so an element's grouping does
+    not depend on the elements before it.
+    ``grouped_tokens`` ``(start, stop)`` restricts the grouping to one contiguous
+    token range (the video tokens of a joint sequence); the other tokens follow
+    it in input order. Grouped among the video tokens, a text or audio key would
+    sit before the long tail of video keys in the rows that attend to it, and
+    the tail's probabilities, encoded against that row maximum, would round to
+    zero.
     """
     b, s, h, d = v.shape
+    if grouped_tokens is not None:
+        start, stop = grouped_tokens
+        if not 0 <= start < stop <= s:
+            raise ValueError(
+                "grouped_tokens must be a non-empty range within the sequence"
+            )
+        perm, centroids = vc_token_permutation(
+            v[:, start:stop],
+            num_clusters=num_clusters,
+            iters=iters,
+            generator=generator,
+            init_centroids=init_centroids,
+        )
+        rest = torch.cat(
+            [
+                torch.arange(start, device=v.device),
+                torch.arange(stop, s, device=v.device),
+            ]
+        )
+        perm = torch.cat([perm + start, rest.expand(b, h, -1)], dim=-1)
+        return perm, centroids
     if num_clusters is None:
         num_clusters = VC_KMEANS_CLUSTERS
     # Seeding draws distinct value rows, so a short sequence caps the clusters.
@@ -164,6 +197,10 @@ def vc_token_permutation(
         num_clusters,
         d,
     )
+    if not warm:
+        seed_rows = torch.randperm(s, device=v.device, generator=generator)[
+            :num_clusters
+        ]
     for bi in range(b):
         for h0 in range(0, h, chunk_h):
             h1 = min(h, h0 + chunk_h)
@@ -173,17 +210,7 @@ def vc_token_permutation(
             if warm:
                 centroids = init_centroids[g0 : g0 + gsz].to(x.dtype)
             else:
-                idx = torch.stack(
-                    [
-                        torch.randperm(s, device=v.device, generator=generator)[
-                            :num_clusters
-                        ]
-                        for _ in range(gsz)
-                    ]
-                )  # [G, k]
-                centroids = torch.gather(
-                    x, 1, idx.unsqueeze(-1).expand(-1, -1, d)
-                )  # [G, k, D]
+                centroids = x[:, seed_rows]  # [G, k, D]
             x_sq = (x * x).sum(-1, keepdim=True)  # [G, S, 1]
             labels = None
             for _ in range(iters):
@@ -392,9 +419,12 @@ class VCAttentionPreprocessor:
     recomputed every ``perm_refresh_every`` steps (k-means warm-started from
     the previous centroids) and kept afterwards, when the plain per-channel
     E4M3 V runs with zero tile means. ``kmeans_clusters`` (``None`` = 64) and
-    ``kmeans_iters`` parametrize the online k-means. Without a denoise step
-    the grouping is computed once per K/V geometry and kept. With ``q`` the
-    preparation is the VC-Attention-QK8 one (one E4M3 Q scale per 128 tokens).
+    ``kmeans_iters`` parametrize the online k-means. Step 0 cold-starts it from
+    the preprocessor's own generator, reseeded with ``VC_KMEANS_SEED``, so a
+    generation neither inherits the centroids of the previous one nor draws
+    from the caller's global generator. Without a denoise step the grouping is
+    computed once per K/V geometry and kept. With ``q`` the preparation is the
+    VC-Attention-QK8 one (one E4M3 Q scale per 128 tokens).
     """
 
     def __init__(
@@ -417,8 +447,19 @@ class VCAttentionPreprocessor:
         self.perm_refresh_every = perm_refresh_every
         self.kmeans_clusters = kmeans_clusters
         self.kmeans_iters = kmeans_iters
-        # Per (batch, seq_len_k, num_kv_heads): perm, centroids, step of the last refresh.
-        self._groupings: dict[tuple[int, int, int], dict[str, Any]] = {}
+        self._generator: torch.Generator | None = None
+        # Per (batch, seq_len_k, num_kv_heads, grouped token range): perm,
+        # centroids, step of the last refresh.
+        self._groupings: dict[
+            tuple[int, int, int, tuple[int, int] | None], dict[str, Any]
+        ] = {}
+
+    def _cold_generator(self, device: torch.device) -> torch.Generator:
+        """The preprocessor's k-means generator, reseeded for a new generation."""
+        if self._generator is None or self._generator.device != device:
+            self._generator = torch.Generator(device=device)
+        self._generator.manual_seed(VC_KMEANS_SEED)
+        return self._generator
 
     @torch.no_grad()
     @torch.compiler.disable
@@ -429,15 +470,19 @@ class VCAttentionPreprocessor:
         *,
         q: torch.Tensor | None = None,
         denoise_step: tuple[int, int] | None = None,
+        grouped_tokens: tuple[int, int] | None = None,
     ) -> VCAttentionOperands:
         """Return the operands of one run for ``[B, S, H, D]`` bf16 K/V, and Q
         under VC-Attention-QK8.
 
         ``denoise_step`` is the sampler's ``(step_index, num_steps)``. Kept
         out of torch.compile so the step index and the k-means refresh do not
-        recompile the caller per step.
+        recompile the caller per step. ``grouped_tokens`` is the ``(start, stop)``
+        token range the k-means groups (the video tokens of a joint sequence);
+        the other tokens follow it in input order. ``None`` groups the whole
+        sequence.
         """
-        key = (k.shape[0], k.shape[1], k.shape[2])
+        key = (k.shape[0], k.shape[1], k.shape[2], grouped_tokens)
         entry = self._groupings.get(key)
         smooth = True
         refresh = entry is None
@@ -455,11 +500,20 @@ class VCAttentionPreprocessor:
             )
         if smooth:
             if refresh:
+                # A step at or before the last refresh starts a generation cold
+                # (step 0, or a sampler that begins later); later refreshes
+                # warm-start from the centroids of this generation.
+                cold = entry is None or (
+                    denoise_step is not None
+                    and (entry["step"] is None or denoise_step[0] <= entry["step"])
+                )
                 perm, centroids = vc_token_permutation(
                     v,
                     num_clusters=self.kmeans_clusters,
                     iters=self.kmeans_iters,
-                    init_centroids=None if entry is None else entry["centroids"],
+                    generator=self._cold_generator(v.device) if cold else None,
+                    init_centroids=None if cold else entry["centroids"],
+                    grouped_tokens=grouped_tokens,
                 )
                 step = None if denoise_step is None else denoise_step[0]
                 if entry is None:
@@ -491,6 +545,7 @@ class VCAttentionPreprocessor:
 __all__ = [
     "VC_KMEANS_CLUSTERS",
     "VC_KMEANS_ITERS",
+    "VC_KMEANS_SEED",
     "VC_PERM_REFRESH_EVERY",
     "VC_SMOOTH_STEP_FRACTION",
     "VCAttentionOperands",

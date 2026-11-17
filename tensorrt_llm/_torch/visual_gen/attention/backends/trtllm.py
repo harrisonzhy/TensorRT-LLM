@@ -105,13 +105,17 @@ def prepare_vc_operands(
     repair_budget: float,
     preprocessor: Optional["VCAttentionPreprocessor"],
     denoise_step: Optional[tuple[int, int]],
+    grouped_tokens: Optional[tuple[int, int]] = None,
 ) -> "VCAttentionOperands":
     """Quantize ``[B, S, H, D]`` bf16 Q, K and V for one VC-Attention forward.
 
     With a repair budget the highest-residual tokens are appended as V repair
     rows. Otherwise the layer-owned ``preprocessor`` groups the value tokens
     and splits V into tile means and E4M3 residuals on the V-Smooth schedule
-    given by ``denoise_step``. Under QK8 ``q`` is rotated and quantized too.
+    given by ``denoise_step``. ``grouped_tokens`` is the ``(start, stop)`` token
+    range the grouping covers, the video tokens of a joint sequence; the other
+    tokens follow it in input order. ``None`` groups the whole sequence. Under
+    QK8 ``q`` is rotated and quantized too.
     """
     from ....attention.backends.prims_ts.vc_attention.quantization import vc_quantize_repair
 
@@ -120,7 +124,9 @@ def prepare_vc_operands(
         return vc_quantize_repair(k, v, budget=repair_budget, q=vc_q)
     if preprocessor is None:
         raise ValueError("the tile-mean VC-Attention recipe needs a preprocessor")
-    return preprocessor.prepare(k, v, q=vc_q, denoise_step=denoise_step)
+    return preprocessor.prepare(
+        k, v, q=vc_q, denoise_step=denoise_step, grouped_tokens=grouped_tokens
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -495,6 +501,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         seq_len: int,
         kv_seq_len: int,
         timestep: object,
+        grouped_tokens: Optional[tuple[int, int]] = None,
     ) -> "VCAttentionOperands":
         """Prepare the VC-Attention operands of this call from compact Q, K and V.
 
@@ -532,6 +539,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             repair_budget=quant_cfg.vc_repair_budget,
             preprocessor=self._vc_preprocessor,
             denoise_step=denoise_step,
+            grouped_tokens=grouped_tokens,
         )
 
     def should_use_sparse(self, sparse_attn_phase: Optional[int]) -> bool:
@@ -604,6 +612,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         sparse_backend_args: Optional[SparseBackendForwardArgs] = None,
         timestep: Optional[torch.Tensor] = None,
         kv: Optional[ForwardPlan] = None,
+        grouped_tokens: Optional[tuple[int, int]] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -645,6 +654,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 The first ``kv.num_tokens`` rows are real; rows past them are padding,
                 neither cached nor attended, and output zero. ``batch_size`` must be 1.
                 Sparse attention is not supported on this path.
+            grouped_tokens: Under VC-Attention, the ``(start, stop)`` token range the
+                value grouping covers: the video tokens of a joint sequence, whose
+                text or audio tokens follow them in input order. ``None`` groups the
+                whole sequence.
 
         Returns:
             Output tensor [B, S, H*D]
@@ -680,7 +693,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 quantization_kwargs = {
                     "vc_attention": True,
                     "vc_operands": self._vc_operands(
-                        q, k, v, batch_size, seq_len, kv_seq_len, timestep
+                        q, k, v, batch_size, seq_len, kv_seq_len, timestep, grouped_tokens
                     ),
                 }
             elif quant_cfg is not None:
